@@ -1,81 +1,362 @@
-GroundTruth
+# GroundTruth
 
-An LLM output monitor that catches two things most teams don't watch for: when a model's answers quietly drift over time, and when it states something false with total confidence.
+**An LLM monitoring system for detecting hallucinations and tracking model behavior over time.**
 
-Most AI products get evaluated once, then trusted indefinitely. But the model behind them keeps changing -- provider updates, prompt tweaks -- and a confidently wrong answer looks identical to a correct one unless something is actually checking. GroundTruth runs known-answer questions through an LLM on a schedule, scores each response for factual grounding, verifies anything suspicious with a second AI reading the actual content (not just a similarity score), and tracks whether the model's behavior is shifting between runs.
+AI systems are often evaluated during development and then trusted in production. The problem is that models can change as providers update them, prompts are modified, or configurations evolve. A response can also sound confident while being factually incorrect.
 
-Architecture
-Ask  ->  Score  ->  Verify  ->  Report  ->  Track drift
-Stage	What it does	Why this way
-Ask	Sends benchmark questions (TruthfulQA) through the model, logs every call -- prompt, response, tokens, latency, cost -- to Postgres.	TruthfulQA is built from questions people commonly get wrong, so it actually exercises the failure mode this tool exists to catch, not just easy trivia.
-Score	Embeds the response and compares it against known correct/incorrect reference answers (cosine similarity).	Cheap and fast enough to run on every call. Explicitly a heuristic -- flags likely problems, isn't a verdict on its own.
-Verify	A second LLM call (LangGraph: verify -> synthesize) reads the flagged answer's actual content and judges it directly, then writes a one-sentence plain-English incident note.	The similarity heuristic has real false positives (a correct answer can embed oddly). A second pass that reads content, not scores, catches those -- see Results below for a case where it mattered.
-Track drift	PSI (Population Stability Index) compares the distribution of scores between two runs of the same questions. Same technique used on an earlier project, Watchtower, applied here to LLM output instead of tabular ML features.	Answers the actual question this tool is for: not "is this answer wrong" but "has behavior changed."
-Other choices worth explaining:
+**GroundTruth** addresses both problems. It runs known-answer benchmark questions through an LLM, evaluates the responses, verifies suspicious results with a second AI model, and tracks changes in model behavior across repeated runs.
 
-OpenTelemetry GenAI semantic conventions for tracing every call (gen_ai.* attributes) instead of a custom logging format -- these traces would work with Langfuse, Arize Phoenix, or Datadog without writing per-backend integration code.
-Supabase/Postgres for storage, with RLS on and no anon policies -- the raw prompt/response data is only ever readable via the backend's service key, never directly.
-A public dashboard (Next.js) reads from separate, deliberately unauthenticated aggregate endpoints that exclude live-traffic data by a hard filter (source='benchmark') -- a public status page showing someone's real prompt would be a privacy problem the moment live traffic starts flowing through this.
-Results
-From running this against qwen-plus:
+---
 
-PSI = 0.0096 comparing two independent 30-question runs of the same model, same day -- correctly near zero, which is what should happen when nothing has actually changed. That's the pipeline validating itself before it's trusted to flag something real.
-~21% of flagged answers were confirmed genuinely wrong after the verify stage, on questions deliberately built from common misconceptions -- consistent with what TruthfulQA is designed to surface, not a sign of an unstable model.
-A real, reproducible catch: asked repeatedly who "the richest person who didn't finish high school" is, the model gave different named individuals (Richard Branson in some runs, Amancio Ortega in others) -- genuine answer instability on a specific fact, exactly the kind of thing drift-checking is meant to surface, not just wording changes.
-The verifier caught its own mistake being made. An early version of the verify prompt asked the model to answer with the word confirmed or false_positive without specifying what was being confirmed -- and the model quietly inverted its meaning, labeling accurate answers as hallucinations and a real wrong answer as fine. Caught by checking actual output content against the labels, not by trusting the labels. Fixed by asking a plain yes/no accuracy question instead and mapping the result in code, not in the model's word choice.
-Run it
-Backend:
+## Architecture
 
-Supabase: create a project, run every file in supabase/ in order (schema.sql through schema_06_cost.sql) in the SQL Editor.
-cd backend && cp .env.example .env and fill in the values, including a real GROUNDTRUTH_API_KEY -- without one, every protected route returns 401 by design.
-python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+```text
+Ask → Score → Verify → Report → Track Drift
+```
+
+### 1. Ask
+
+Benchmark questions from **TruthfulQA** are sent through the target LLM. Each request is logged with information such as the prompt, response, token usage, latency, and estimated cost.
+
+### 2. Score
+
+The system compares model responses with known reference answers using embedding-based cosine similarity.
+
+This is intentionally treated as a **heuristic**, not a final accuracy decision. Its purpose is to identify responses that require further investigation.
+
+### 3. Verify
+
+Responses flagged by the scoring stage are passed to a second LLM through a **LangGraph verification workflow**.
+
+The verifier reads the actual response content and determines whether the answer is genuinely incorrect. It also generates a short, plain-English incident report.
+
+### 4. Track Drift
+
+**Population Stability Index (PSI)** is used to compare score distributions between different runs of the same benchmark.
+
+This shifts the focus from simply asking:
+
+> "Is this answer wrong?"
+
+to:
+
+> "Has the model's behavior changed?"
+
+---
+
+## Key Design Decisions
+
+### OpenTelemetry
+
+LLM calls are instrumented using **OpenTelemetry GenAI semantic conventions**, including `gen_ai.*` attributes for model information, tokens, latency, cost, and errors.
+
+This keeps the observability layer compatible with platforms such as Langfuse, Arize Phoenix, and Datadog.
+
+### Supabase / PostgreSQL
+
+Supabase provides the PostgreSQL database used for storing benchmark and monitoring data.
+
+Row Level Security (RLS) is enabled, while raw prompt and response data remains accessible through the backend service key rather than directly through the public database interface.
+
+### Public Dashboard
+
+The project includes a **Next.js dashboard** for displaying monitoring results.
+
+The public-facing endpoints expose aggregate benchmark information and deliberately exclude live-traffic data using the `source='benchmark'` filter. This prevents potentially sensitive user prompts or responses from appearing on a public dashboard.
+
+---
+
+# Results
+
+The monitoring pipeline was tested using `qwen-plus`.
+
+### PSI Drift
+
+Two independent 30-question runs produced:
+
+```text
+PSI = 0.0096
+```
+
+The very low PSI indicates minimal distribution change between the two runs, which is the expected result when the model's behavior remains stable.
+
+### Hallucination Verification
+
+Approximately **21% of responses initially flagged by the scoring stage were confirmed as genuinely incorrect** after verification.
+
+This demonstrates why the verification stage is important: embedding similarity is useful for identifying suspicious responses, but it should not be treated as the final accuracy decision.
+
+### Reproducible Answer Instability
+
+The system also identified a reproducible example of factual instability.
+
+When repeatedly asked who "the richest person who didn't finish high school" was, the model returned different individuals across runs, including **Richard Branson** and **Amancio Ortega**.
+
+This represents the type of behavioral inconsistency that GroundTruth is designed to surface.
+
+### Verification Failure That Led to an Improvement
+
+During development, an early verification prompt used the labels `confirmed` and `false_positive` without clearly defining what the labels represented.
+
+The model occasionally inverted their intended meaning.
+
+The issue was identified by comparing the verification output against the actual answer content. The workflow was subsequently changed to ask a direct yes/no accuracy question, with the final mapping handled in code rather than relying on the model's choice of label.
+
+---
+
+# Getting Started
+
+## Backend
+
+### 1. Set Up Supabase
+
+Create a Supabase project and execute the SQL files in the `supabase/` directory in order, from:
+
+```text
+schema.sql
+```
+
+through:
+
+```text
+schema_06_cost.sql
+```
+
+### 2. Configure Environment Variables
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+Add the required environment variables, including a valid:
+
+```text
+GROUNDTRUTH_API_KEY
+```
+
+Protected API routes require this key and return `401` when it is missing or invalid.
+
+### 3. Install Dependencies
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4. Start the API
+
+```bash
 uvicorn app.main:app --reload
-Try it (note the X-API-Key header, and that /v1/chat is rate-limited to 10/minute per caller):
-curl -X POST localhost:8000/v1/chat \
-  -H "Content-Type: application/json" -H "X-API-Key: YOUR_KEY" \
-  -d '{"prompt": "What is the capital of Nigeria?", "query_type": "geography"}'
-Pipeline (run in order):
+```
 
+### 5. Test the API
+
+The `/v1/chat` endpoint requires an API key and is rate-limited to 10 requests per minute per caller.
+
+```bash
+curl -X POST localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_KEY" \
+  -d '{"prompt": "What is the capital of Nigeria?", "query_type": "geography"}'
+```
+
+---
+
+# Monitoring Pipeline
+
+Run the pipeline in the following order:
+
+```bash
 python -m scripts.load_benchmark --n 30 --run-id my-run
 python -m scripts.embed_calls
 python -m scripts.score_hallucination
-python -m scripts.run_agents        # verify + write plain-English incident reports
-python -m scripts.psi_drift         # compares the two most recent runs if no args given
-python -m scripts.check_alerts      # posts to Slack if drift or flag rate is over threshold
-.github/workflows/monitor.yml runs this whole sequence daily via GitHub Actions -- add SUPABASE_URL, SUPABASE_SERVICE_KEY, DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, and optionally SLACK_WEBHOOK_URL as repo secrets to enable it. .github/workflows/ci.yml runs the test suite on every push (no secrets needed). .github/workflows/purge.yml runs the retention purge monthly.
+python -m scripts.run_agents
+python -m scripts.psi_drift
+python -m scripts.check_alerts
+```
 
-Tests:
+The pipeline performs the following tasks:
 
-cd backend && pytest tests/ -v
-Covers the drift (PSI) and hallucination-scoring math in isolation (app/drift.py, app/hallucination.py) -- no network or database needed.
+1. Loads benchmark questions
+2. Generates model responses
+3. Creates embeddings
+4. Scores potential hallucinations
+5. Verifies flagged responses
+6. Calculates PSI drift
+7. Sends alerts when configured thresholds are exceeded
 
-Dashboard:
+The GitHub Actions workflow in `.github/workflows/monitor.yml` can run the monitoring pipeline automatically each day.
 
+---
+
+# Testing
+
+Run the test suite with:
+
+```bash
+cd backend
+pytest tests/ -v
+```
+
+The tests cover the core PSI drift calculations and hallucination-scoring logic without requiring a network connection or live database.
+
+---
+
+# Dashboard
+
+Start the frontend with:
+
+```bash
 cd frontend
 cp .env.local.example .env.local
 npm install
 npm run dev
-Open http://localhost:3000. Set FRONTEND_ORIGIN in the backend's .env to match wherever the dashboard is running (CORS).
+```
 
-Deploy
-Push this repo to GitHub (Render and Vercel both deploy from a connected repo).
-Backend, on Render: dashboard -> New -> Blueprint -> connect the repo. Render reads render.yaml at the repo root automatically. You'll be prompted for the sync: false secrets -- leave FRONTEND_ORIGIN blank for now.
-Frontend, on Vercel: dashboard -> Add New -> Project -> import the same repo. Set Root Directory to frontend. Add NEXT_PUBLIC_API_BASE_URL = your Render backend's URL.
-Back on Render, set FRONTEND_ORIGIN to your new Vercel URL, so CORS allows the deployed dashboard to reach the API.
-For the scheduled workflows: add the same secrets as GitHub repo secrets (Settings -> Secrets and variables -> Actions) -- separate from Render's and Vercel's env vars.
-Render's free tier sleeps after 15 minutes of inactivity; the first request after that takes 30-60 seconds to wake back up. That's expected -- the dashboard's "unreachable" state is exactly what handles that gracefully.
+The dashboard is available at:
 
-Observability
-Every LLM call emits an OpenTelemetry span (gen_ai.* attributes: model, tokens, latency, cost, errors). Spans print to the console by default; set OTEL_EXPORTER_OTLP_ENDPOINT to send them to Langfuse, Phoenix, Datadog, or any other OTLP-compatible backend instead.
+```text
+http://localhost:3000
+```
 
-Data retention
-Raw prompt/response text is purged after 90 days (scripts/purge_old_calls.py, monthly via .github/workflows/purge.yml). Numeric scores (hallucination flags, drift snapshots) are kept indefinitely so trend charts still work after the raw text is gone.
+Set `FRONTEND_ORIGIN` in the backend environment configuration to the dashboard's URL so that CORS is configured correctly.
 
-Security notes
-Rotate DASHSCOPE_API_KEY if it's ever appeared in a terminal session shared outside your own machine.
-GROUNDTRUTH_API_KEY gates every route except /, /health, and /docs. Treat it like a password.
-Supabase tables use the service key from the backend only; RLS is on with no policies, so the anon key can't read anything even if it leaked.
-What's real vs. stubbed
-Real: call logging, live/benchmark source labels, embedding-based drift (PSI), hallucination-score heuristic, LangGraph verify+synthesize agent pipeline, cost estimation, OTel tracing, API auth, rate limiting, pagination past 1000 rows, data retention purge, CI, scheduled runs, alerting, the dashboard, deploy config.
+---
 
-Not yet built: retrieval-augmented grounding for live (non-benchmark) traffic -- the hallucination check currently relies on TruthfulQA's reference answers, which only exist for benchmark questions.
+# Deployment
+
+GroundTruth can be deployed using **Render** for the backend and **Vercel** for the frontend.
+
+### Backend — Render
+
+1. Push the repository to GitHub.
+2. Create a new Render Blueprint.
+3. Connect the repository.
+4. Render will use the `render.yaml` configuration at the repository root.
+5. Configure the required environment variables and secrets.
+
+### Frontend — Vercel
+
+1. Import the same repository into Vercel.
+2. Set the root directory to:
+
+```text
+frontend
+```
+
+3. Configure:
+
+```text
+NEXT_PUBLIC_API_BASE_URL
+```
+
+using the deployed backend URL.
+
+4. Add the Vercel URL to the backend's `FRONTEND_ORIGIN`.
+
+GitHub Actions can then be configured separately for scheduled monitoring, testing, alerting, and data-retention workflows.
+
+> **Note:** Render's free tier may put the backend to sleep after a period of inactivity. The first request after sleeping can therefore take longer while the service starts again.
+
+---
+
+# Observability
+
+Every LLM request generates an OpenTelemetry span containing information such as:
+
+* Model
+* Token usage
+* Latency
+* Estimated cost
+* Errors
+
+By configuring:
+
+```text
+OTEL_EXPORTER_OTLP_ENDPOINT
+```
+
+the traces can be sent to an OTLP-compatible observability platform such as Langfuse, Arize Phoenix, or Datadog.
+
+---
+
+# Data Retention
+
+Raw prompt and response data is automatically purged after **90 days** through:
+
+```text
+scripts/purge_old_calls.py
+```
+
+The purge process is scheduled monthly through:
+
+```text
+.github/workflows/purge.yml
+```
+
+Numerical monitoring data, including hallucination flags and drift snapshots, is retained for long-term trend analysis.
+
+---
+
+# Security
+
+GroundTruth includes several security controls:
+
+* API-key authentication for protected routes
+* Rate limiting on the chat endpoint
+* Supabase Row Level Security
+* Backend-only access to the database service key
+* Separation of benchmark and live-traffic data
+* Automated data retention and deletion
+* Environment-based secret management
+
+API keys should never be committed to the repository.
+
+---
+
+# Current Scope
+
+### Implemented
+
+* LLM call logging
+* Benchmark and live source labels
+* Embedding-based scoring
+* PSI drift detection
+* Hallucination scoring
+* LangGraph verification workflow
+* Incident reporting
+* Cost estimation
+* OpenTelemetry tracing
+* API authentication
+* Rate limiting
+* Pagination
+* Data-retention automation
+* CI testing
+* Scheduled monitoring
+* Alerting
+* Monitoring dashboard
+* Deployment configuration
+
+### Planned
+
+The current hallucination detection workflow is designed around benchmark questions with known reference answers.
+
+**Retrieval-augmented grounding for live, non-benchmark traffic is not yet implemented.** This is the next major area for extending the system beyond benchmark-based evaluation.
+
+---
+
+## Project Goal
+
+GroundTruth is built around a simple idea:
+
+**LLM applications should be monitored after deployment, not just evaluated before it.**
+
+By combining automated evaluation, secondary verification, drift detection, observability, and reporting, the project provides a practical foundation for understanding how an LLM behaves as it changes over time.
+
+## Author
+
+**Casmir Udeme**
+
+Data Scientist/Analyst | AI/ML | Business Intelligence
