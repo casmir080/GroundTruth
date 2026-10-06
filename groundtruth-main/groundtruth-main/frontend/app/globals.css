@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/* GroundTruth instrument-panel theme. Deliberately a single fixed dark
+   palette rather than following prefers-color-scheme -- this is built to
+   read like a measurement instrument (an oscilloscope, a seismograph),
+   and that identity doesn't flip with a visitor's OS setting. */
+:root {
+  --color-ink: #10141a;
+  --color-panel: #171c24;
+  --color-panel-border: #262c38;
+  --color-text: #e9e5dc;
+  --color-text-muted: #8891a0;
+  --color-amber: #e6a23c;
+  --color-rust: #c4573b;
+  --color-sage: #6fa88f;
+
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+}
+
+@theme inline {
+  --color-ink: var(--color-ink);
+  --color-panel: var(--color-panel);
+  --color-panel-border: var(--color-panel-border);
+  --color-text: var(--color-text);
+  --color-text-muted: var(--color-text-muted);
+  --color-amber: var(--color-amber);
+  --color-rust: var(--color-rust);
+  --color-sage: var(--color-sage);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: var(--color-ink);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+/* visible keyboard focus, kept subtle but real */
+:focus-visible {
+  outline: 2px solid var(--color-amber);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

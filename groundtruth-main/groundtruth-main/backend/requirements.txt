@@ -1,0 +1,12 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+supabase>=2.9
+openai>=1.50
+pydantic-settings>=2.5
+pytest>=8.0
+datasets>=3.0
+sentence-transformers>=3.0
+langgraph>=1.0,<2.0
+slowapi>=0.1.9
+opentelemetry-api>=1.27
+opentelemetry-sdk>=1.27
